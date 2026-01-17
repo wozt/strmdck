@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import binascii
 import json
+import logging
 import os
 import shutil
 import time
@@ -30,9 +31,40 @@ from deepdiff import DeepDiff
 from dotenv import load_dotenv
 
 from ..device import ButtonAction, DeckDevice
-from ..utils import compress_folder, random_string
+from ..utils import compress_folder
+
+logger = logging.getLogger(__name__)
+# Separate logger for invalid-byte correction so it can be filtered independently.
+logger_fix = logging.getLogger(__name__ + ".fix")
+
+# Set to 1 to force console logging without environment variables.
+FORCE_ULANZI_LOGGING = 0
+# Set to 1 to force detailed correction logs even if general logging is off.
+FORCE_ULANZI_FIX_LOGGING = 1
+# Padding config for ZIP invalid-byte mitigation.
+PADDING_SIZE = 64
+PADDING_ATTEMPTS = 10
+
+def _configure_logging_from_env():
+    """Enable console logging when env flags or FORCE_ULANZI_LOGGING are set."""
+    debug_flag = os.getenv('ULANZI_DEBUG')
+    level_name = os.getenv('ULANZI_LOG_LEVEL')
+
+    if not FORCE_ULANZI_LOGGING and not debug_flag and not level_name:
+        return
+
+    level = logging.DEBUG if debug_flag or FORCE_ULANZI_LOGGING else getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+    logger.setLevel(level)
+    # Use the same level for the fix logger unless explicitly forced.
+    logger_fix.setLevel(logging.DEBUG if FORCE_ULANZI_FIX_LOGGING else level)
 
 load_dotenv()
+_configure_logging_from_env()
+
 timezone = ZoneInfo(os.getenv('TIMEZONE', 'America/New_York'))
 
 
@@ -266,44 +298,64 @@ class UlanziD200Device(DeckDevice):
             json.dump(manifest, fp, sort_keys=True, separators=(',', ':'), indent=2)
 
         # Chunks start with these bytes cause problems
-        invalid_bytes = [
-            b'\x00',
-            # b'\x01',
-            b'\x7c',
-        ]
+        invalid_bytes = {b'\x00'[0], b'\x7c'[0]}
+        padding_path = os.path.join(page_path, 'padding.bin')
 
-        dummy_str = ''
-        dummy_retries = 0
-        dummy_path = os.path.join(page_path, 'dummy.txt')
+        def _find_invalid(data: bytes):
+            return [i for i in range(1016, len(data), 1024) if data[i:i + 1] and data[i] in invalid_bytes]
 
-        while True:
-            # Write a dummy file with random string to modify the zip
-            if dummy_retries > 0:
-                with open(dummy_path, 'w') as fp:
-                    print('Generating dummy string...')
-                    dummy_str += random_string(8 * dummy_retries)
-                    fp.write(dummy_str)
-
-            # Create ZIP file
+        try:
+            # First attempt: build ZIP normally.
             compress_folder(page_path, '.build.zip', 1)
-            file_size = os.path.getsize('.build.zip')
 
-            # There is a bug with the deck when byte value at 1016, 1016 + 1024... is one of invalid_bytes
-            # Check to avoid that
-            valid = True
             with open('.build.zip', 'rb') as fp:
-                for i in range(1016, file_size, 1024):
-                    fp.seek(i)
-                    byte_at = fp.read(1)
-                    if byte_at in invalid_bytes:
-                        valid = False
+                zip_data = fp.read()
+
+            file_size = len(zip_data)
+            fixed_offsets = _find_invalid(zip_data)
+
+            # If invalid bytes, try repeated padding rebuilds before byte patching.
+            if fixed_offsets:
+                for attempt in range(1, PADDING_ATTEMPTS + 1):
+                    logger_fix.warning(
+                        f'Invalid bytes detected at offsets {fixed_offsets} (size={file_size}); attempt {attempt}/{PADDING_ATTEMPTS} with padding {PADDING_SIZE} bytes'
+                    )
+                    with open(padding_path, 'wb') as fp:
+                        fp.write(b'\x00' * PADDING_SIZE)
+
+                    compress_folder(page_path, '.build.zip', 1)
+                    with open('.build.zip', 'rb') as fp:
+                        zip_data = fp.read()
+
+                    file_size = len(zip_data)
+                    fixed_offsets = _find_invalid(zip_data)
+
+                    if not fixed_offsets:
+                        logger_fix.info(f'Padding resolved invalid bytes on attempt {attempt}')
                         break
 
-            if valid:
-                break
+            if fixed_offsets:
+                logger_fix.warning(f'Invalid bytes remain at offsets {fixed_offsets} (size={file_size}); patching to 0x01')
+                patched = bytearray(zip_data)
+                for idx in fixed_offsets:
+                    patched[idx] = 0x01
 
-            dummy_retries += 1
-            time.sleep(0.05)
+                with open('.build.zip', 'wb') as fp:
+                    fp.write(patched)
+
+                with open('.build.zip', 'rb') as fp:
+                    verify_data = fp.read()
+                remaining = _find_invalid(verify_data)
+                if remaining:
+                    logger_fix.error(f'Invalid bytes remain after patch at offsets {remaining}')
+                else:
+                    logger_fix.info('Patched invalid bytes successfully')
+        finally:
+            if os.path.exists(padding_path):
+                try:
+                    os.remove(padding_path)
+                except OSError:
+                    logger_fix.debug('Could not remove padding file (already removed?)')
 
         shutil.move('.build.zip', os.path.join('.build', 'build.zip'))
         return True
