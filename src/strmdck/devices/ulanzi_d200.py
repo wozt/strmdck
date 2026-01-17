@@ -43,7 +43,7 @@ FORCE_ULANZI_LOGGING = 0
 FORCE_ULANZI_FIX_LOGGING = 1
 # Padding config for ZIP invalid-byte mitigation.
 PADDING_SIZE = 64
-PADDING_ATTEMPTS = 10
+PADDING_ATTEMPTS = 20
 
 def _configure_logging_from_env():
     """Enable console logging when env flags or FORCE_ULANZI_LOGGING are set."""
@@ -84,6 +84,10 @@ class CommandProtocol(Enum):
 
     IN_BUTTON = 0x0101
     IN_DEVICE_INFO = 0x0303
+
+
+class InvalidZipContent(Exception):
+    """Raised when button ZIP still contains invalid bytes after mitigation."""
 
 
 class LengthAdapter(Adapter):
@@ -204,7 +208,9 @@ class UlanziD200Device(DeckDevice):
         self._write_packet(packet)
 
     def set_buttons(self, buttons: Dict[int, Dict], *, update_only=False):
-        self._prepare_zip(buttons)
+        zip_ready = self._prepare_zip(buttons)
+        if not zip_ready:
+            raise InvalidZipContent("Invalid bytes remained after mitigation; icons need regeneration")
         chunk_size = 1024
 
         data = b''
@@ -335,21 +341,11 @@ class UlanziD200Device(DeckDevice):
                         break
 
             if fixed_offsets:
-                logger_fix.warning(f'Invalid bytes remain at offsets {fixed_offsets} (size={file_size}); patching to 0x01')
-                patched = bytearray(zip_data)
-                for idx in fixed_offsets:
-                    patched[idx] = 0x01
-
-                with open('.build.zip', 'wb') as fp:
-                    fp.write(patched)
-
-                with open('.build.zip', 'rb') as fp:
-                    verify_data = fp.read()
-                remaining = _find_invalid(verify_data)
-                if remaining:
-                    logger_fix.error(f'Invalid bytes remain after patch at offsets {remaining}')
-                else:
-                    logger_fix.info('Patched invalid bytes successfully')
+                logger_fix.error(
+                    f'Invalid bytes remain after {PADDING_ATTEMPTS} padding attempts at offsets {fixed_offsets} '
+                    f'(size={file_size}); forcing regeneration'
+                )
+                return False
         finally:
             if os.path.exists(padding_path):
                 try:
