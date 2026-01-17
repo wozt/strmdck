@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import time
+import zipfile
 from datetime import datetime
 from enum import Enum
 from typing import Dict
@@ -41,8 +42,7 @@ logger_fix = logging.getLogger(__name__ + ".fix")
 FORCE_ULANZI_LOGGING = 0
 # Set to 1 to force detailed correction logs even if general logging is off.
 FORCE_ULANZI_FIX_LOGGING = 1
-# Padding config for ZIP invalid-byte mitigation.
-PADDING_SIZE = 64
+# Padding attempts: write a padding entry with N bytes (1..PADDING_ATTEMPTS) to shift boundaries.
 PADDING_ATTEMPTS = 20
 
 def _configure_logging_from_env():
@@ -303,55 +303,48 @@ class UlanziD200Device(DeckDevice):
         with open(os.path.join(page_path, 'manifest.json'), 'w') as fp:
             json.dump(manifest, fp, sort_keys=True, separators=(',', ':'), indent=2)
 
-        # Chunks start with these bytes cause problems
+        # Chunks start with these bytes cause problems; steer boundaries with incremental padding.
         invalid_bytes = {b'\x00'[0], b'\x7c'[0]}
-        padding_path = os.path.join(page_path, 'padding.bin')
 
         def _find_invalid(data: bytes):
             return [i for i in range(1016, len(data), 1024) if data[i:i + 1] and data[i] in invalid_bytes]
-
-        try:
-            # First attempt: build ZIP normally.
-            compress_folder(page_path, '.build.zip', 1)
+            
+        BASE_PADDING_BYTES = 1
+        zip_valid = False
+        # Always start with padding of 1 byte, then grow by 1 each attempt.
+        for attempt in range(1, PADDING_ATTEMPTS + 1):
+            pad_bytes = BASE_PADDING_BYTES + (attempt - 1)
+            with zipfile.ZipFile('.build.zip', 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                zf.writestr('padding.bin', b'\x00' * pad_bytes, compress_type=zipfile.ZIP_STORED)
+                manifest_path = os.path.join(page_path, 'manifest.json')
+                zf.write(manifest_path, 'manifest.json')
+                for root, _, files in os.walk(page_path):
+                    for file in files:
+                        if file in ('manifest.json', 'padding.bin'):
+                            continue
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, page_path)
+                        zf.write(file_path, arcname)
 
             with open('.build.zip', 'rb') as fp:
                 zip_data = fp.read()
 
             file_size = len(zip_data)
             fixed_offsets = _find_invalid(zip_data)
+            if not fixed_offsets:
+                zip_valid = True
+                if pad_bytes > BASE_PADDING_BYTES:
+                    logger_fix.info(f'Padding with {pad_bytes} byte(s) resolved invalid bytes')
+                break
+            logger_fix.warning(
+                f'Invalid bytes detected at offsets {fixed_offsets} (size={file_size}); attempt {attempt}/{PADDING_ATTEMPTS} with padding {pad_bytes} byte(s)'
+            )
 
-            # If invalid bytes, try repeated padding rebuilds before byte patching.
-            if fixed_offsets:
-                for attempt in range(1, PADDING_ATTEMPTS + 1):
-                    logger_fix.warning(
-                        f'Invalid bytes detected at offsets {fixed_offsets} (size={file_size}); attempt {attempt}/{PADDING_ATTEMPTS} with padding {PADDING_SIZE} bytes'
-                    )
-                    with open(padding_path, 'wb') as fp:
-                        fp.write(b'\x00' * PADDING_SIZE)
-
-                    compress_folder(page_path, '.build.zip', 1)
-                    with open('.build.zip', 'rb') as fp:
-                        zip_data = fp.read()
-
-                    file_size = len(zip_data)
-                    fixed_offsets = _find_invalid(zip_data)
-
-                    if not fixed_offsets:
-                        logger_fix.info(f'Padding resolved invalid bytes on attempt {attempt}')
-                        break
-
-            if fixed_offsets:
-                logger_fix.error(
-                    f'Invalid bytes remain after {PADDING_ATTEMPTS} padding attempts at offsets {fixed_offsets} '
-                    f'(size={file_size}); forcing regeneration'
-                )
-                return False
-        finally:
-            if os.path.exists(padding_path):
-                try:
-                    os.remove(padding_path)
-                except OSError:
-                    logger_fix.debug('Could not remove padding file (already removed?)')
+        if not zip_valid:
+            logger_fix.error(
+                f'Invalid bytes remain after {PADDING_ATTEMPTS} padding attempts at offsets {fixed_offsets} (size={file_size}); forcing regeneration'
+            )
+            return False
 
         shutil.move('.build.zip', os.path.join('.build', 'build.zip'))
         return True
